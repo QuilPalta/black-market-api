@@ -164,42 +164,60 @@ app.post('/api/inventory', async (req, res) => {
     }
 });
 
-// 5. CREAR ORDEN DE COMPRA
+// 6. CREAR PEDIDO (Con validación de stock y transacción)
 app.post('/api/orders', async (req, res) => {
     const { customer_name, contact_info, items, total } = req.body;
-
-    if (!items || items.length === 0) {
-        return res.status(400).json({ error: "El carrito está vacío" });
-    }
+    
+    // Necesitamos un cliente individual para manejar la transacción
+    const client = await pool.connect();
 
     try {
-        // 1. Insertar la orden
-        // Guardamos 'items' como JSON para tener el histórico exacto de qué compró y a qué precio en ese momento
-        const orderQuery = `
-            INSERT INTO orders (customer_name, contact_info, items, total)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id;
-        `;
-        const orderValues = [customer_name, contact_info, JSON.stringify(items), total];
-        const orderResult = await db.query(orderQuery, orderValues);
-        const orderId = orderResult.rows[0].id;
+        await client.query('BEGIN'); // Iniciamos la transacción
 
-        // 2. Actualizar Stock (Descontar inventario)
-        // Recorremos los items y restamos la cantidad comprada
+        // 1. Validar Stock y Restar Cantidades
         for (const item of items) {
-            // Nota: Usamos el ID de base de datos (item.id)
-            await db.query(`
-                UPDATE inventory 
-                SET stock = stock - $1 
-                WHERE id = $2
-            `, [item.quantity, item.id]);
+            // Buscamos el stock actual de la carta (bloqueamos la fila para evitar conflictos)
+            // Asumimos que 'item.id' es el ID de la base de datos (inventory.id)
+            const checkRes = await client.query(
+                'SELECT id, card_name, stock FROM inventory WHERE id = $1 FOR UPDATE',
+                [item.id]
+            );
+
+            if (checkRes.rows.length === 0) {
+                throw new Error(`El producto "${item.card_name}" ya no existe.`);
+            }
+
+            const product = checkRes.rows[0];
+
+            if (product.stock < item.quantity) {
+                throw new Error(`Stock insuficiente para "${product.card_name}". Disponible: ${product.stock}, Pedido: ${item.quantity}`);
+            }
+
+            // Restamos el stock
+            await client.query(
+                'UPDATE inventory SET stock = stock - $1 WHERE id = $2',
+                [item.quantity, item.id]
+            );
         }
 
-        res.status(201).json({ success: true, orderId: orderId });
+        // 2. Crear la Orden
+        const orderResult = await client.query(
+            'INSERT INTO orders (customer_name, contact_info, items, total) VALUES ($1, $2, $3, $4) RETURNING *',
+            [customer_name, contact_info, JSON.stringify(items), total]
+        );
+
+        await client.query('COMMIT'); // Confirmamos los cambios si todo salió bien
+        
+        res.status(201).json(orderResult.rows[0]);
 
     } catch (error) {
-        console.error("Error creando orden:", error);
-        res.status(500).json({ error: "Error al procesar el pedido" });
+        await client.query('ROLLBACK'); // Deshacemos todo si hubo error
+        console.error("Error creando pedido:", error);
+        
+        // Devolvemos el mensaje de error específico (ej: "Stock insuficiente...")
+        res.status(400).json({ error: error.message });
+    } finally {
+        client.release(); // Liberamos el cliente
     }
 });
 
